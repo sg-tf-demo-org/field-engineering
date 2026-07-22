@@ -9,12 +9,13 @@ name: deploy
 #                        HOOD via mcp-tf-governance). Fail-closed. No apply.
 #   Approve - <env>      Native GitHub Environment required-reviewer gate. A
 #                        human must approve before it (and thus deploy) proceeds.
-#   Deploy - <env>       Self-hosted runner assumes the per-env AWS role via OIDC
-#                        and runs `terraform apply`. Apply happens ONLY here.
+#   Deploy - <env>       ubuntu-latest assumes the per-env AWS role via OIDC and
+#                        runs `terraform plan` ONLY. `terraform apply` is
+#                        intentionally commented out for this demo.
 #
 # The whole chain is sequential: dev fully promotes before stage, stage before
 # prod. If a Governance gate fails, its Approve/Deploy never run, and no later
-# environment is touched. Apply never happens on the PR / gate path.
+# environment is touched. Apply never happens on the PR / gate / deploy path.
 # ============================================================================
 on:
   workflow_dispatch:
@@ -24,6 +25,8 @@ on:
       - "environments/**"
       - "modules/**"
       - ".github/workflows/**"
+      - "scripts/**"
+      - "docs/**"
 
 # No workflow-level id-token: only the Deploy jobs need OIDC (declared per job).
 permissions:
@@ -49,12 +52,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev            # required reviewers on this env pause here for a human
     steps:
-      - run: echo "dev governance PASSED and approved by a human — proceeding to Deploy - dev."
+      - run: echo "dev governance PASSED and approved by a human — proceeding to Deploy - dev (plan-only)."
 
   deploy-dev:
     name: Deploy - dev
     needs: approve-dev
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
@@ -67,11 +70,14 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::697091778198:role/dev-fe-infra-otel-demo-deploy
           aws-region: us-east-1
-      - name: Terraform apply (dev)
+      - name: Terraform plan (dev)
         working-directory: environments/dev
         run: |
+          set -euo pipefail
           terraform init -input=false
-          terraform apply -input=false -auto-approve
+          terraform plan -input=false
+          # APPLY INTENTIONALLY DISABLED for this demo (plan-only progressive deploy).
+          # terraform apply -input=false -auto-approve
 
   # ============================ STAGE ============================
   governance-stage:
@@ -89,12 +95,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: stage
     steps:
-      - run: echo "stage governance PASSED and approved by a human — proceeding to Deploy - stage."
+      - run: echo "stage governance PASSED and approved by a human — proceeding to Deploy - stage (plan-only)."
 
   deploy-stage:
     name: Deploy - stage
     needs: approve-stage
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
@@ -107,11 +113,14 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::697091778198:role/stage-fe-infra-otel-demo-deploy
           aws-region: us-east-1
-      - name: Terraform apply (stage)
+      - name: Terraform plan (stage)
         working-directory: environments/stage
         run: |
+          set -euo pipefail
           terraform init -input=false
-          terraform apply -input=false -auto-approve
+          terraform plan -input=false
+          # APPLY INTENTIONALLY DISABLED for this demo (plan-only progressive deploy).
+          # terraform apply -input=false -auto-approve
 
   # ============================ PROD ============================
   governance-prod:
@@ -129,12 +138,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: prod
     steps:
-      - run: echo "prod governance PASSED and approved by a human — proceeding to Deploy - prod."
+      - run: echo "prod governance PASSED and approved by a human — proceeding to Deploy - prod (plan-only)."
 
   deploy-prod:
     name: Deploy - prod
     needs: approve-prod
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
@@ -147,8 +156,11 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::697091778198:role/prod-fe-infra-otel-demo-deploy
           aws-region: us-east-1
-      - name: Terraform apply (prod)
+      - name: Terraform plan (prod)
         working-directory: environments/prod
         run: |
+          set -euo pipefail
           terraform init -input=false
-          terraform apply -input=false -auto-approve
+          terraform plan -input=false
+          # APPLY INTENTIONALLY DISABLED for this demo (plan-only progressive deploy).
+          # terraform apply -input=false -auto-approve

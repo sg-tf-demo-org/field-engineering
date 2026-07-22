@@ -58,4 +58,9 @@ jobs:
           AIDEN_TF_GOV_MCP_URL: ${{ secrets.AIDEN_TF_GOV_MCP_URL }}
           AIDEN_TF_GOV_MCP_TOKEN: ${{ secrets.AIDEN_TF_GOV_MCP_TOKEN }}
           AIDEN_DEPLOY_GATE_WEBHOOK_URL: ${{ secrets.AIDEN_DEPLOY_GATE_WEBHOOK_URL }}
+          AIDEN_GUILD_TOKEN: ${{ secrets.AIDEN_GUILD_TOKEN }}
+          AIDEN_ORG_ID: ${{ secrets.AIDEN_ORG_ID }}
+          # Fetch execution status briefly; do not block the MCP verdict.
+          GATE_EXEC_POLL_TIMEOUT: "30"
+          GATE_EXEC_POLL_INTERVAL: "5"
         run: python3 scripts/aiden_gate.py

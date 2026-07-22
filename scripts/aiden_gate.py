@@ -44,6 +44,7 @@ def env(*names: str, default: str = "") -> str:
 
 GUILD_BASE = env("AIDEN_GUILD_BASE", default="https://stage.dev.stackgen.com").rstrip("/")
 ORG_ID = env("AIDEN_ORG_ID", default="aee77bee-6885-4b4b-b9c0-e0c7ae81be96")
+GUILD_TOKEN = env("AIDEN_GUILD_TOKEN")  # optional; used to fetch execution status
 MCP_URL = env("AIDEN_TF_GOV_MCP_URL", default="https://mcp-tf-governance.stackgen.run/mcp")
 MCP_TOKEN = env("AIDEN_TF_GOV_MCP_TOKEN")
 WEBHOOK_URL = env("AIDEN_DEPLOY_GATE_WEBHOOK_URL")
@@ -55,6 +56,8 @@ ENVIRONMENT = env("GATE_ENVIRONMENT", default="dev")
 RUN_URL = env("GATE_RUN_URL")
 
 MCP_TIMEOUT = int(env("GATE_MCP_TIMEOUT", default="600"))  # tool call read timeout
+EXEC_POLL_INTERVAL = int(env("GATE_EXEC_POLL_INTERVAL", default="10"))
+EXEC_POLL_TIMEOUT = int(env("GATE_EXEC_POLL_TIMEOUT", default="120"))
 
 
 def summary(md: str) -> None:
@@ -121,6 +124,44 @@ def fire_webhook() -> str:
     else:
         summary(f"- Aiden reporter: webhook HTTP `{code}` (no run_id returned)")
     return run_id
+
+
+def fetch_execution_status(run_id: str) -> str:
+    """GET /guild/api/v1/executions/{run_id} and return status (best-effort).
+
+    The Guild API exposes status (completed/failed/...) but NOT findings/verdict
+    (structured_output is empty). We still fetch + print status so the job shows
+    the execution was retrieved; the authoritative PASS/FAIL comes from the MCP.
+    """
+    if not run_id:
+        return ""
+    # Prefer a Guild token when present; fall back to unauthenticated GET (may 401).
+    headers = {"Accept": "application/json"}
+    if GUILD_TOKEN:
+        headers["Authorization"] = f"Bearer {GUILD_TOKEN}"
+        headers["x-org-id"] = ORG_ID
+    url = f"{GUILD_BASE}/guild/api/v1/executions/{run_id}?orgId={ORG_ID}"
+    deadline = time.time() + EXEC_POLL_TIMEOUT
+    last_status = ""
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode() or "{}")
+            ex = body.get("execution") or body
+            last_status = (ex.get("status") or body.get("status") or "").lower()
+            if last_status in ("completed", "failed", "error", "succeeded", "finished"):
+                break
+        except Exception as e:  # noqa: BLE001
+            summary(f"- Aiden execution fetch: `{e}` (non-fatal; continuing)")
+            return last_status
+        time.sleep(EXEC_POLL_INTERVAL)
+    if last_status:
+        summary(f"- Aiden execution status (fetched): `{last_status}` · "
+                f"[watch]({watch_url(run_id)})")
+    else:
+        summary(f"- Aiden execution status: not available · [watch]({watch_url(run_id)})")
+    return last_status
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +262,8 @@ def main() -> int:
     summary(f"- Project: `{PROJECT}` · ref: `{REF}` · dir: `{TF_DIR}`")
 
     run_id = fire_webhook()
+    if run_id:
+        fetch_execution_status(run_id)
 
     summary("- Verdict source: Aiden `mcp-tf-governance.validate_tf_governance` "
             "(terraform plan + Trivy + Rego under the hood).")
@@ -243,8 +286,11 @@ def main() -> int:
     plan_error = (verdict.get("plan_error") or "").strip()
 
     summary(f"- Gates: `{gate_line}` · scanned: `{scanned}` · {dt}s")
+    if run_id:
+        summary(f"- Aiden watch: {watch_url(run_id)}")
     if v == "PASS":
-        summary(f"\n**Result: PASS ✅** — `{ENVIRONMENT}` governance passed. Deploy may proceed after approval.")
+        summary(f"\n**Result: PASS ✅** — `{ENVIRONMENT}` governance passed. "
+                "Deploy (plan-only) may proceed after approval.")
         return 0
 
     summary(f"\n**Result: {v} ❌** — `{ENVIRONMENT}` governance FAILED. No approval / deploy.")
@@ -254,8 +300,6 @@ def main() -> int:
     if findings:
         summary("\n<details><summary>findings</summary>\n\n```\n"
                 + findings[:4000] + "\n```\n</details>")
-    if run_id:
-        summary(f"\nWatch Aiden's scan: {watch_url(run_id)}")
     return 1
 
 
