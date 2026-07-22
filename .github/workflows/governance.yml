@@ -1,0 +1,72 @@
+name: governance-gate
+
+# Reusable, PLAN-BASED governance gate. Mirrors governance/scan-tf.sh exactly:
+#   terraform init -> plan -out -> show -json -> trivy(HIGH,CRITICAL) + conftest.
+# Fail-closed: if a plan cannot be produced, the gate errors and never passes.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment name (dev/stage/prod)
+        required: true
+        type: string
+      tf_dir:
+        description: Terraform working directory for this env
+        required: true
+        type: string
+      role_arn:
+        description: AWS IAM role ARN to assume via OIDC for plan
+        required: true
+        type: string
+      runs_on:
+        description: Runner label
+        required: false
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ${{ inputs.runs_on }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Install trivy + conftest
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin"
+          CONFTEST_VERSION=0.56.0
+          curl -sfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" | tar xz -C "$HOME/.local/bin" conftest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: us-east-1
+
+      - name: Run governance gate (scan-tf.sh)
+        run: |
+          chmod +x governance/scan-tf.sh
+          ./governance/scan-tf.sh "${{ inputs.tf_dir }}" --json gate-result.json
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: |
+            ${{ inputs.tf_dir }}/tfplan.binary
+            ${{ inputs.tf_dir }}/tfplan.json
+            gate-result.json
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,107 @@
+name: deploy
+
+# Progressive per-environment deploy: dev -> stage -> prod.
+# Each environment is gated by the SAME plan-based governance gate (governance.yml)
+# and protected by a GitHub Environment (reviewers / wait timers configured in
+# repo settings). No apply runs unless that environment's gate passed.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  # Deploy roles follow the naming <env>-fe-infra-otel-demo-deploy in this account.
+  AWS_ACCOUNT_ID: "697091778198"
+
+jobs:
+  # ---------------- DEV ----------------
+  gate-dev:
+    uses: ./.github/workflows/governance.yml
+    with:
+      environment: dev
+      tf_dir: environments/dev
+      role_arn: arn:aws:iam::697091778198:role/dev-fe-infra-otel-demo-deploy
+
+  deploy-dev:
+    needs: gate-dev
+    runs-on: [self-hosted]
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::697091778198:role/dev-fe-infra-otel-demo-deploy
+          aws-region: us-east-1
+      - name: Terraform apply (dev)
+        working-directory: environments/dev
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+  # ---------------- STAGE ----------------
+  gate-stage:
+    needs: deploy-dev
+    uses: ./.github/workflows/governance.yml
+    with:
+      environment: stage
+      tf_dir: environments/stage
+      role_arn: arn:aws:iam::697091778198:role/stage-fe-infra-otel-demo-deploy
+
+  deploy-stage:
+    needs: gate-stage
+    runs-on: [self-hosted]
+    environment: stage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::697091778198:role/stage-fe-infra-otel-demo-deploy
+          aws-region: us-east-1
+      - name: Terraform apply (stage)
+        working-directory: environments/stage
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+  # ---------------- PROD ----------------
+  gate-prod:
+    needs: deploy-stage
+    uses: ./.github/workflows/governance.yml
+    with:
+      environment: prod
+      tf_dir: environments/prod
+      role_arn: arn:aws:iam::697091778198:role/prod-fe-infra-otel-demo-deploy
+
+  deploy-prod:
+    needs: gate-prod
+    runs-on: [self-hosted]
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::697091778198:role/prod-fe-infra-otel-demo-deploy
+          aws-region: us-east-1
+      - name: Terraform apply (prod)
+        working-directory: environments/prod
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
