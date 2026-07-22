@@ -4,6 +4,19 @@ GitHub Actions **orchestrates and sequences** the deploy; **Aiden is the governa
 brain and reporter**. Every environment must clear an Aiden governance gate and a
 human approval before anything is planned.
 
+## PR head scans (before merge)
+
+Human-first loop on every PR head SHA (`.github/workflows/pr-governance.yml` →
+`scripts/pr_aiden_gate.py`):
+
+1. Commit status `aiden/governance` → `pending`
+2. PR webhook creates a watchable Aiden session (reporter)
+3. Direct `validate_tf_governance` (no `tf_dir`) plans changed dirs vs base and
+   returns PASS/FAIL/ERROR (brain)
+4. Status → `success` | `failure` | `error` with Details → `session:{id}` watch URL
+
+The job fails on non-PASS so it can be a required check. Same MCP engine as deploy.
+
 ## Pipeline (`.github/workflows/deploy.yml`)
 
 Per environment there are three visible stages, run strictly in order:
@@ -65,3 +78,10 @@ the run's *Review deployments* prompt (or the environment's page).
 `Deploy - <env>` runs on `ubuntu-latest` with OIDC. It runs `terraform init` +
 `terraform plan`. The `terraform apply` line is commented out so the progressive
 Governance → Approve → Deploy demo completes end-to-end without mutating AWS.
+
+## OIDC trust note
+
+GitHub emits subjects like
+`repo:sg-tf-demo-org@<orgId>/field-engineering@<repoId>:ref:refs/heads/main`.
+Deploy roles must StringLike-match `repo:sg-tf-demo-org@*/field-engineering@*:*`
+(and include `sts:TagSession` for `aws-actions/configure-aws-credentials@v4`).
