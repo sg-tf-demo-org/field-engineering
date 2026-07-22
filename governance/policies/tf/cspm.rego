@@ -52,7 +52,20 @@ deny contains msg if {
 	sse := rule.apply_server_side_encryption_by_default[_]
 	sse.sse_algorithm == "aws:kms"
 	not sse.kms_master_key_id
+	not s3_sse_cmk_known_after_apply(r.address)
 	msg := sprintf("CSPM: %s uses aws:kms without kms_master_key_id (CMK required)", [r.address])
+}
+
+# When the CMK is created in the same plan, its ARN is "known after apply":
+# terraform omits kms_master_key_id from `after` but flags it in `after_unknown`.
+# Its presence there proves a CMK reference is wired, so it is not a violation
+# (matches the plan-time handling of the EKS encryption provider above).
+s3_sse_cmk_known_after_apply(addr) if {
+	some rc in input.resource_changes
+	rc.address == addr
+	some rule in rc.change.after_unknown.rule
+	ap := rule.apply_server_side_encryption_by_default[_]
+	ap.kms_master_key_id == true
 }
 
 # ---------------------------------------------------------------------------
@@ -70,7 +83,15 @@ deny contains msg if {
 	r.type == "aws_ebs_volume"
 	r.values.encrypted == true
 	not r.values.kms_key_id
+	not ebs_cmk_known_after_apply(r.address)
 	msg := sprintf("CSPM: %s (aws_ebs_volume) is encrypted without a customer-managed kms_key_id", [r.address])
+}
+
+# CMK created in the same plan -> kms_key_id is "known after apply".
+ebs_cmk_known_after_apply(addr) if {
+	some rc in input.resource_changes
+	rc.address == addr
+	rc.change.after_unknown.kms_key_id == true
 }
 
 # ---------------------------------------------------------------------------
