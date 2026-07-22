@@ -1,0 +1,218 @@
+name: pr-governance-scan
+
+# ============================================================================
+# BYPASS / BACKSTOP path — GitHub PR governance scan.
+#
+# PRIMARY (sanctioned) gate is SHIFT-LEFT / PRE-PR: Aiden authors Terraform and
+# runs the governance gate BEFORE a PR exists via `mcp-tf-governance.submit_tf_pr`
+# (plan-based: terraform plan -> trivy + conftest). A failing change never
+# becomes a PR on that path.
+#
+# THIS workflow is the REQUIRED MERGE BACKSTOP (defense-in-depth): when someone
+# opens a PR *directly* against `main` (skipping the pre-PR gate), it re-runs the
+# SAME deterministic, plan-based gate (governance/scan-tf.sh) and then notifies
+# Aiden. It is the GitHub-PR analog of the GitLab `notify_aiden_mr_governance`
+# job, and its `gate` job is analogous to deploy.yml's `gate-dev` / the reusable
+# governance.yml `gate` job.
+#
+#   gate         -> plan-based governance gate (trivy HIGH/CRITICAL + conftest)
+#   notify-aiden -> POST pr_governance_scan payload to the Aiden 2.0 webhook
+#                   "Github PR governance scan" (target agent: platform-engineer)
+# ============================================================================
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "scenarios/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_DIR: scenarios/pr-governance-demo
+
+jobs:
+  # -------------------------------------------------------------------------
+  # gate: run the SAME plan-based governance gate as governance.yml / gate-dev.
+  # continue-on-error on the scan so a FAIL still lets notify-aiden run.
+  # -------------------------------------------------------------------------
+  gate:
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      verdict: ${{ steps.scan.outputs.verdict }}
+      exit_code: ${{ steps.scan.outputs.exit_code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Install trivy + conftest
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin"
+          CONFTEST_VERSION=0.56.0
+          curl -sfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" | tar xz -C "$HOME/.local/bin" conftest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # OIDC into the dev deploy role (same role deploy.yml/gate-dev uses).
+      # continue-on-error so that even if OIDC/plan cannot run on a hosted
+      # runner, the scan step still runs and notify-aiden still fires with a
+      # best-effort verdict.
+      - name: Configure AWS credentials (OIDC)
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::697091778198:role/dev-fe-infra-otel-demo-deploy
+          aws-region: us-east-1
+
+      - name: Run governance gate (scan-tf.sh)
+        id: scan
+        continue-on-error: true
+        run: |
+          set +e
+          chmod +x governance/scan-tf.sh
+          ./governance/scan-tf.sh "${TF_DIR}" --json gate-result.json
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 0 ]; then
+            echo "verdict=PASS" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=ERROR" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::notice title=Governance gate::verdict=$([ "$rc" -eq 0 ] && echo PASS || ([ "$rc" -eq 1 ] && echo FAIL || echo ERROR)) (exit $rc)"
+          # Do not fail the job — notify-aiden must run and report the verdict.
+          exit 0
+
+      - name: Collect gate findings + PR context
+        if: always()
+        run: |
+          set +e
+          PLAN="${TF_DIR}/tfplan.json"
+
+          # trivy HIGH/CRITICAL misconfigurations (best-effort)
+          if [ -f "$PLAN" ] && command -v trivy >/dev/null 2>&1; then
+            trivy config --quiet --severity HIGH,CRITICAL -f json "$PLAN" 2>/dev/null \
+              | jq -c '[.Results[]?.Misconfigurations[]? | "trivy \(.Severity) \(.ID): \(.Title)"]' \
+              > trivy-findings.json || echo '[]' > trivy-findings.json
+          else
+            echo '[]' > trivy-findings.json
+          fi
+
+          # conftest (rego) deny messages (best-effort)
+          if [ -f "$PLAN" ] && command -v conftest >/dev/null 2>&1; then
+            conftest test -p governance/policies/tf -o json "$PLAN" 2>/dev/null \
+              | jq -c '[.[].failures[]?.msg]' \
+              > conftest-findings.json || echo '[]' > conftest-findings.json
+          else
+            echo '[]' > conftest-findings.json
+          fi
+
+          jq -s -c 'add // []' trivy-findings.json conftest-findings.json > findings.json || echo '[]' > findings.json
+          echo "findings.json:"; cat findings.json
+
+          # changed files in this PR (empty for workflow_dispatch)
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] && git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" | head -100 \
+              | jq -R -s -c 'split("\n")|map(select(length>0))' > changed-files.json || echo '[]' > changed-files.json
+          else
+            echo '[]' > changed-files.json
+          fi
+          echo "changed-files.json:"; cat changed-files.json
+
+      - name: Upload gate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-governance-gate
+          path: |
+            gate-result.json
+            findings.json
+            changed-files.json
+            ${{ env.TF_DIR }}/tfplan.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # notify-aiden: POST the pr_governance_scan payload to the Aiden 2.0 webhook.
+  # Analogous to the GitLab notify_aiden_mr_governance job. Runs on PASS, FAIL,
+  # or ERROR (if: always()) so Aiden always sees the bypass PR.
+  # -------------------------------------------------------------------------
+  notify-aiden:
+    needs: gate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download gate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-governance-gate
+        continue-on-error: true
+
+      - name: Notify Aiden PR governance webhook
+        env:
+          AIDEN_PR_GOVERNANCE_WEBHOOK_URL: ${{ secrets.AIDEN_PR_GOVERNANCE_WEBHOOK_URL }}
+          GATE_VERDICT: ${{ needs.gate.outputs.verdict }}
+          GATE_EXIT_CODE: ${{ needs.gate.outputs.exit_code }}
+        run: |
+          set +e
+          if [ -z "${AIDEN_PR_GOVERNANCE_WEBHOOK_URL:-}" ]; then
+            echo "WARN: AIDEN_PR_GOVERNANCE_WEBHOOK_URL secret unset — skipping Aiden notify"
+            exit 0
+          fi
+
+          VERDICT="${GATE_VERDICT:-ERROR}"
+          FINDINGS=$(cat findings.json 2>/dev/null || echo '[]')
+          CHANGED=$(cat changed-files.json 2>/dev/null || echo '[]')
+          # guard against malformed/empty files
+          echo "$FINDINGS" | jq -e . >/dev/null 2>&1 || FINDINGS='[]'
+          echo "$CHANGED"  | jq -e . >/dev/null 2>&1 || CHANGED='[]'
+
+          PAYLOAD=$(jq -n \
+            --arg project        "${{ github.repository }}" \
+            --arg pr_number      "${{ github.event.pull_request.number }}" \
+            --arg pr_url         "${{ github.event.pull_request.html_url }}" \
+            --arg source_branch  "${{ github.event.pull_request.head.ref }}" \
+            --arg target_branch  "${{ github.event.pull_request.base.ref }}" \
+            --arg run_url        "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg verdict        "$VERDICT" \
+            --argjson changed    "$CHANGED" \
+            --argjson findings   "$FINDINGS" \
+            '{
+              source: "github-actions",
+              event: "pr_governance_scan",
+              kind: "terraform",
+              project: $project,
+              pr_number: $pr_number,
+              pr_url: $pr_url,
+              source_branch: $source_branch,
+              target_branch: $target_branch,
+              run_url: $run_url,
+              changed_files: $changed,
+              gate_verdict: $verdict,
+              gate_findings: $findings,
+              instruction: "Bypass/human GitHub PR that skipped the pre-PR mcp-tf-governance gate. Re-scan the Terraform plan governance (CSPM customer-managed KMS + mandatory Owner/CostCenter/Environment tags + region us-east-1) and report PASS/FAIL on the PR. Do NOT deploy."
+            }')
+
+          echo "Posting pr_governance_scan (verdict=$VERDICT) to Aiden webhook..."
+          echo "$PAYLOAD" | jq -c '.gate_verdict, (.gate_findings|length)'
+          HTTP=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST "$AIDEN_PR_GOVERNANCE_WEBHOOK_URL" \
+            -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "HTTP $HTTP"
+          cat /tmp/resp.json 2>/dev/null | head -c 800; echo
+          case "$HTTP" in
+            2*) echo "OK: notified Aiden PR governance webhook (HTTP $HTTP)";;
+            *)  echo "WARN: Aiden webhook returned HTTP $HTTP (best-effort, not failing the demo)";;
+          esac
+          exit 0
