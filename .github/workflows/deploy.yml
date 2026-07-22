@@ -1,9 +1,21 @@
 name: deploy
 
-# Progressive per-environment deploy: dev -> stage -> prod.
-# Each environment is gated by the SAME plan-based governance gate (governance.yml)
-# and protected by a GitHub Environment (reviewers / wait timers configured in
-# repo settings). No apply runs unless that environment's gate passed.
+# ============================================================================
+# Model A — Aiden-gated progressive deploy (GitHub-orchestrated).
+#
+# Per environment there are THREE visible stages, run strictly in order:
+#
+#   Governance - <env>   Aiden governance gate (plan + Trivy + Rego UNDER THE
+#                        HOOD via mcp-tf-governance). Fail-closed. No apply.
+#   Approve - <env>      Native GitHub Environment required-reviewer gate. A
+#                        human must approve before it (and thus deploy) proceeds.
+#   Deploy - <env>       Self-hosted runner assumes the per-env AWS role via OIDC
+#                        and runs `terraform apply`. Apply happens ONLY here.
+#
+# The whole chain is sequential: dev fully promotes before stage, stage before
+# prod. If a Governance gate fails, its Approve/Deploy never run, and no later
+# environment is touched. Apply never happens on the PR / gate path.
+# ============================================================================
 on:
   workflow_dispatch:
   push:
@@ -13,28 +25,39 @@ on:
       - "modules/**"
       - ".github/workflows/**"
 
+# No workflow-level id-token: only the Deploy jobs need OIDC (declared per job).
 permissions:
-  id-token: write
   contents: read
 
 env:
   AWS_REGION: us-east-1
-  # Deploy roles follow the naming <env>-fe-infra-otel-demo-deploy in this account.
   AWS_ACCOUNT_ID: "697091778198"
 
 jobs:
-  # ---------------- DEV ----------------
-  gate-dev:
+  # ============================ DEV ============================
+  governance-dev:
+    name: Governance - dev
     uses: ./.github/workflows/governance.yml
+    secrets: inherit
     with:
       environment: dev
       tf_dir: environments/dev
-      role_arn: arn:aws:iam::697091778198:role/dev-fe-infra-otel-demo-deploy
+
+  approve-dev:
+    name: Approve - dev
+    needs: governance-dev
+    runs-on: ubuntu-latest
+    environment: dev            # required reviewers on this env pause here for a human
+    steps:
+      - run: echo "dev governance PASSED and approved by a human — proceeding to Deploy - dev."
 
   deploy-dev:
-    needs: gate-dev
+    name: Deploy - dev
+    needs: approve-dev
     runs-on: [self-hosted]
-    environment: dev
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -50,19 +73,31 @@ jobs:
           terraform init -input=false
           terraform apply -input=false -auto-approve
 
-  # ---------------- STAGE ----------------
-  gate-stage:
+  # ============================ STAGE ============================
+  governance-stage:
+    name: Governance - stage
     needs: deploy-dev
     uses: ./.github/workflows/governance.yml
+    secrets: inherit
     with:
       environment: stage
       tf_dir: environments/stage
-      role_arn: arn:aws:iam::697091778198:role/stage-fe-infra-otel-demo-deploy
+
+  approve-stage:
+    name: Approve - stage
+    needs: governance-stage
+    runs-on: ubuntu-latest
+    environment: stage
+    steps:
+      - run: echo "stage governance PASSED and approved by a human — proceeding to Deploy - stage."
 
   deploy-stage:
-    needs: gate-stage
+    name: Deploy - stage
+    needs: approve-stage
     runs-on: [self-hosted]
-    environment: stage
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -78,19 +113,31 @@ jobs:
           terraform init -input=false
           terraform apply -input=false -auto-approve
 
-  # ---------------- PROD ----------------
-  gate-prod:
+  # ============================ PROD ============================
+  governance-prod:
+    name: Governance - prod
     needs: deploy-stage
     uses: ./.github/workflows/governance.yml
+    secrets: inherit
     with:
       environment: prod
       tf_dir: environments/prod
-      role_arn: arn:aws:iam::697091778198:role/prod-fe-infra-otel-demo-deploy
+
+  approve-prod:
+    name: Approve - prod
+    needs: governance-prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - run: echo "prod governance PASSED and approved by a human — proceeding to Deploy - prod."
 
   deploy-prod:
-    needs: gate-prod
+    name: Deploy - prod
+    needs: approve-prod
     runs-on: [self-hosted]
-    environment: prod
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
