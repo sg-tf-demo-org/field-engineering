@@ -1,21 +1,11 @@
 name: pr-governance-scan
 
 # ============================================================================
-# BYPASS / BACKSTOP path — GitHub PR governance scan (Aiden-only).
+# Notify Aiden of a PR, resolve the real Aiden watch URL (Guild trace_id), then
+# attach that URL to the PR head COMMIT as a GitHub commit status so reviewers
+# can open the scan from the commit itself (Details link).
 #
-# CORE PRINCIPLE: this stage gate ONLY TALKS TO AIDEN. It does NOT run
-# terraform / governance scanners or assume any AWS role. When a PR is opened
-# directly against `main` (bypassing the sanctioned pre-PR
-# `mcp-tf-governance.submit_tf_pr` gate), this workflow POSTs the PR context to
-# the Aiden 2.0 "Github PR governance scan" webhook. Aiden runs
-# `mcp-tf-governance.validate_tf_governance` and reports PASS / FAIL /
-# plan-failure. The job summary links the Aiden execution watch URL so a human
-# can review (and approve) from what they see in Aiden.
-#
-# NOTE: the webhook's `run_id` is NOT the UI watch id. We resolve the real
-# `trace_id` from GET /guild/api/v1/executions by correlating on `run_url`.
-#
-# Nothing here ever runs `terraform apply`.
+# The webhook `run_id` is NOT the UI watch id — we correlate via run_url.
 # ============================================================================
 on:
   pull_request:
@@ -28,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   notify-aiden:
@@ -42,7 +33,6 @@ jobs:
           python-version: "3.12"
 
       - name: Compute changed files
-        id: diff
         run: |
           set +e
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
@@ -53,34 +43,36 @@ jobs:
           else
             echo '[]' > changed-files.json
           fi
-          echo "changed files:"; cat changed-files.json
 
-      - name: Notify Aiden PR governance webhook
+      - name: Notify Aiden and attach scan link to commit
         env:
           AIDEN_PR_GOVERNANCE_WEBHOOK_URL: ${{ secrets.AIDEN_PR_GOVERNANCE_WEBHOOK_URL }}
           AIDEN_GUILD_TOKEN: ${{ secrets.AIDEN_GUILD_TOKEN }}
           AIDEN_ORG_ID: ${{ secrets.AIDEN_ORG_ID }}
           AIDEN_GUILD_BASE: https://stage.dev.stackgen.com
           AIDEN_WATCH_RESOLVE_TIMEOUT: "90"
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          set +e
+          set -euo pipefail
           if [ -z "${AIDEN_PR_GOVERNANCE_WEBHOOK_URL:-}" ]; then
-            echo "WARN: AIDEN_PR_GOVERNANCE_WEBHOOK_URL secret unset — skipping Aiden notify"
+            echo "WARN: AIDEN_PR_GOVERNANCE_WEBHOOK_URL unset — skipping"
             exit 0
           fi
 
           CHANGED=$(cat changed-files.json 2>/dev/null || echo '[]')
           echo "$CHANGED" | jq -e . >/dev/null 2>&1 || CHANGED='[]'
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${HEAD_SHA:-${{ github.sha }}}"
 
-          # Report-only payload. CI does NOT compute a verdict — Aiden does via
-          # mcp-tf-governance.validate_tf_governance.
           PAYLOAD=$(jq -n \
-            --arg project        "${{ github.repository }}" \
+            --arg project        "$REPO" \
             --arg pr_number      "${{ github.event.pull_request.number }}" \
             --arg pr_url         "${{ github.event.pull_request.html_url }}" \
             --arg source_branch  "${{ github.event.pull_request.head.ref }}" \
             --arg target_branch  "${{ github.event.pull_request.base.ref }}" \
+            --arg commit_sha     "$COMMIT_SHA" \
             --arg run_url        "$RUN_URL" \
             --argjson changed    "$CHANGED" \
             '{
@@ -92,50 +84,55 @@ jobs:
               pr_url: $pr_url,
               source_branch: $source_branch,
               target_branch: $target_branch,
+              commit_sha: $commit_sha,
               run_url: $run_url,
               changed_files: $changed,
-              instruction: "Terraform PR bypass — clone branch, run mcp-tf-governance.validate_tf_governance, report PASS/FAIL or plan-failure, never apply."
+              instruction: "Terraform PR — run mcp-tf-governance.validate_tf_governance on this commit/branch, report PASS/FAIL or plan-failure, never apply."
             }')
 
-          echo "Posting pr_governance_scan to Aiden webhook (report-only)..."
+          echo "Notifying Aiden..."
           HTTP=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST "$AIDEN_PR_GOVERNANCE_WEBHOOK_URL" \
             -H "Content-Type: application/json" -d "$PAYLOAD")
-          echo "HTTP $HTTP"
-          cat /tmp/resp.json 2>/dev/null | head -c 400; echo
+          echo "webhook HTTP $HTTP"
 
-          # Webhook run_id is NOT the UI watch id. Resolve the real trace_id by
-          # correlating on run_url embedded in the agent prompt.
+          # Resolve real watch URL (trace_id), not webhook run_id.
           WATCH_URL=""
           if [ -n "${AIDEN_GUILD_TOKEN:-}" ]; then
-            echo "Resolving Aiden watch URL (correlate on run_url)..."
             WATCH_URL=$(python3 scripts/resolve_aiden_watch.py "$RUN_URL" 2>/tmp/resolve.err || true)
             cat /tmp/resolve.err 2>/dev/null || true
-          else
-            echo "WARN: AIDEN_GUILD_TOKEN unset — cannot resolve watchable execution id"
           fi
+
+          if [ -z "$WATCH_URL" ]; then
+            echo "ERROR: could not resolve Aiden watch URL for commit $COMMIT_SHA"
+            # Still mark the commit so reviewers know a scan was attempted.
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/statuses/${COMMIT_SHA}" \
+              -d "$(jq -n \
+                --arg desc "Aiden governance scan — watch URL not resolved" \
+                '{state:"error", context:"aiden/governance", description:$desc}')" \
+              >/dev/null || true
+            exit 0
+          fi
+
+          echo "Watch: $WATCH_URL"
+
+          # Attach the Aiden scan link to THIS commit (Details → opens Aiden).
+          curl -sS -o /tmp/status.json -w "status HTTP %{http_code}\n" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${REPO}/statuses/${COMMIT_SHA}" \
+            -d "$(jq -n \
+              --arg url "$WATCH_URL" \
+              --arg desc "Aiden governance scan — open to review" \
+              '{state:"success", target_url:$url, context:"aiden/governance", description:$desc}')"
+          cat /tmp/status.json | head -c 300; echo
 
           {
-            echo "### Aiden PR governance scan"
+            echo "### Aiden governance"
             echo ""
-            echo "Review the governance result in Aiden and approve / reject from there:"
-            if [ -n "$WATCH_URL" ]; then
-              echo ""
-              echo "**[Open Aiden governance execution](${WATCH_URL})**"
-              echo ""
-              echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
-              echo "- Watch: ${WATCH_URL}"
-            else
-              echo ""
-              echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
-              echo "- Watch URL: not resolved yet (open Aiden → Executions and filter for this PR)"
-            fi
-            echo "- Webhook HTTP: \`${HTTP}\`"
-          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-
-          if [ -n "$WATCH_URL" ]; then
-            echo "OK: notified Aiden (HTTP $HTTP)"
-            echo "Watch: $WATCH_URL"
-          else
-            echo "WARN: Aiden webhook HTTP $HTTP (watch URL not resolved)"
-          fi
-          exit 0
+            echo "Scan linked on commit \`${COMMIT_SHA:0:7}\`:"
+            echo "**[Open Aiden governance execution](${WATCH_URL})**"
+          } >> "$GITHUB_STEP_SUMMARY"
