@@ -4,18 +4,15 @@ name: pr-governance-scan
 # BYPASS / BACKSTOP path — GitHub PR governance scan (Aiden-only).
 #
 # CORE PRINCIPLE: this stage gate ONLY TALKS TO AIDEN. It does NOT run
-# terraform, trivy, conftest, or assume any AWS role. When a PR is opened
+# terraform / governance scanners or assume any AWS role. When a PR is opened
 # directly against `main` (bypassing the sanctioned pre-PR
-# `mcp-tf-governance.submit_tf_pr` gate), this workflow simply POSTs the PR
-# context to the Aiden 2.0 "Github PR governance scan" webhook. Aiden then runs
-# `mcp-tf-governance.validate_tf_governance`, which clones the branch and runs
-# `terraform plan` -> trivy + conftest UNDER THE HOOD, and reports PASS / FAIL /
-# plan-failure back onto the PR.
+# `mcp-tf-governance.submit_tf_pr` gate), this workflow POSTs the PR context to
+# the Aiden 2.0 "Github PR governance scan" webhook. Aiden runs
+# `mcp-tf-governance.validate_tf_governance` and reports PASS / FAIL /
+# plan-failure. The job summary links the Aiden execution watch URL so a human
+# can review (and approve) from what they see in Aiden.
 #
-# Trivy/terraform/OIDC are intentionally INVISIBLE here — they are tools Aiden
-# consumes internally via mcp-tf-governance. This is the GitHub-PR analog of the
-# GitLab `notify_aiden_mr_governance` report-only job. Nothing here ever runs
-# `terraform apply`.
+# Nothing here ever runs `terraform apply`.
 # ============================================================================
 on:
   pull_request:
@@ -27,8 +24,7 @@ on:
   workflow_dispatch:
 
 # Only need to read the repo to compute the changed-file list. No id-token:
-# there is no OIDC / assume-role on this path (that is what fixes the previous
-# "Could not assume role with OIDC" error — the gate no longer assumes a role).
+# there is no OIDC / assume-role on this path.
 permissions:
   contents: read
 
@@ -57,9 +53,7 @@ jobs:
       - name: Notify Aiden PR governance webhook
         env:
           AIDEN_PR_GOVERNANCE_WEBHOOK_URL: ${{ secrets.AIDEN_PR_GOVERNANCE_WEBHOOK_URL }}
-          # Optional: set this repo secret to a run-status endpoint to enable the
-          # best-effort verdict poll below. Unset = report-only (still notifies).
-          AIDEN_RUN_STATUS_URL: ${{ secrets.AIDEN_RUN_STATUS_URL }}
+          AIDEN_WATCH_BASE: https://stage.dev.stackgen.com/app/settings/workspace/devops-copilot/executions
         run: |
           set +e
           if [ -z "${AIDEN_PR_GOVERNANCE_WEBHOOK_URL:-}" ]; then
@@ -70,9 +64,8 @@ jobs:
           CHANGED=$(cat changed-files.json 2>/dev/null || echo '[]')
           echo "$CHANGED" | jq -e . >/dev/null 2>&1 || CHANGED='[]'
 
-          # Report-only payload. CI does NOT compute a verdict or findings —
-          # Aiden (mcp-tf-governance.validate_tf_governance) does that under the
-          # hood (clone branch -> terraform plan -> trivy + conftest).
+          # Report-only payload. CI does NOT compute a verdict — Aiden does via
+          # mcp-tf-governance.validate_tf_governance.
           PAYLOAD=$(jq -n \
             --arg project        "${{ github.repository }}" \
             --arg pr_number      "${{ github.event.pull_request.number }}" \
@@ -92,7 +85,7 @@ jobs:
               target_branch: $target_branch,
               run_url: $run_url,
               changed_files: $changed,
-              instruction: "Terraform PR bypass — clone branch, run terraform plan then Trivy+Rego via mcp-tf-governance.validate_tf_governance, report PASS/FAIL or plan-failure, never apply."
+              instruction: "Terraform PR bypass — clone branch, run mcp-tf-governance.validate_tf_governance, report PASS/FAIL or plan-failure, never apply."
             }')
 
           echo "Posting pr_governance_scan to Aiden webhook (report-only)..."
@@ -101,37 +94,34 @@ jobs:
           echo "HTTP $HTTP"
           cat /tmp/resp.json 2>/dev/null | head -c 800; echo
           RUN_ID=$(jq -r '.run_id // empty' /tmp/resp.json 2>/dev/null)
-          echo "aiden_run_id=$RUN_ID"
+          WATCH_URL=""
+          if [ -n "${RUN_ID:-}" ]; then
+            RID_NODASH=$(echo "$RUN_ID" | tr -d '-')
+            WATCH_URL="${AIDEN_WATCH_BASE}/${RID_NODASH}/watch"
+          fi
+
           {
-            echo "### Aiden PR governance scan";
-            echo "- webhook HTTP: \`$HTTP\`";
-            echo "- Aiden run_id: \`${RUN_ID:-n/a}\`";
-            echo "- Aiden runs mcp-tf-governance.validate_tf_governance on \`${{ github.event.pull_request.head.ref }}\` (plan + Trivy + Rego under the hood) and reports the verdict on this PR.";
+            echo "### Aiden PR governance scan"
+            echo ""
+            echo "Review the governance result in Aiden and approve / reject from there:"
+            if [ -n "$WATCH_URL" ]; then
+              echo ""
+              echo "**[Open Aiden governance execution](${WATCH_URL})**"
+              echo ""
+              echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
+              echo "- Watch URL: ${WATCH_URL}"
+            else
+              echo ""
+              echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
+              echo "- Aiden execution: not returned (webhook HTTP \`${HTTP}\`)"
+            fi
+            echo "- Webhook HTTP: \`${HTTP}\`"
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
-          case "$HTTP" in
-            2*) echo "OK: notified Aiden (HTTP $HTTP, run_id=${RUN_ID:-n/a})";;
-            *)  echo "WARN: Aiden webhook HTTP $HTTP (report-only backstop — not failing the build)"; exit 0;;
-          esac
-
-          # -------- BEST-EFFORT verdict poll (optional, never fails build) -----
-          # Only runs if AIDEN_RUN_STATUS_URL is configured AND we got a run_id.
-          # The trigger endpoint is fire-and-forget (returns 202 + run_id), so
-          # by default this is report-only — Aiden posts the verdict on the PR.
-          if [ -n "${AIDEN_RUN_STATUS_URL:-}" ] && [ -n "${RUN_ID:-}" ]; then
-            echo "Polling Aiden run $RUN_ID for a verdict (best-effort, 120s cap)..."
-            for i in $(seq 1 24); do
-              PHTTP=$(curl -sS -m 10 -o /tmp/run.json -w '%{http_code}' \
-                "${AIDEN_RUN_STATUS_URL%/}/${RUN_ID}" 2>/dev/null)
-              STATUS=$(jq -r '.status // .state // empty' /tmp/run.json 2>/dev/null)
-              VERDICT=$(jq -r '.verdict // .result // empty' /tmp/run.json 2>/dev/null)
-              echo "  poll #$i: http=$PHTTP status=${STATUS:-?} verdict=${VERDICT:-?}"
-              case "$STATUS" in
-                completed|succeeded|finished|failed|error) echo "Aiden verdict: ${VERDICT:-see PR}"; break;;
-              esac
-              sleep 5
-            done
+          if [ -n "$WATCH_URL" ]; then
+            echo "OK: notified Aiden (HTTP $HTTP)"
+            echo "Watch: $WATCH_URL"
           else
-            echo "Report-only: no AIDEN_RUN_STATUS_URL configured — Aiden will post the verdict on the PR."
+            echo "WARN: Aiden webhook HTTP $HTTP (no run_id / watch URL)"
           fi
           exit 0

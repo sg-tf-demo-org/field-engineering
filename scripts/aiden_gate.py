@@ -95,8 +95,8 @@ def fire_webhook() -> str:
         "instruction": (
             f"Progressive deploy gate for `{ENVIRONMENT}`. Run "
             f"mcp-tf-governance.validate_tf_governance(project='{PROJECT}', ref='{REF}', "
-            f"tf_dir='{TF_DIR}') — terraform plan + Trivy + Rego under the hood — and "
-            "report PASS/FAIL/plan-failure. Report-only: never deploy or apply."
+            f"tf_dir='{TF_DIR}') and report PASS/FAIL/plan-failure. "
+            "Report-only: never deploy or apply."
         ),
     }
     data = json.dumps(payload).encode()
@@ -265,8 +265,7 @@ def main() -> int:
     if run_id:
         fetch_execution_status(run_id)
 
-    summary("- Verdict source: Aiden `mcp-tf-governance.validate_tf_governance` "
-            "(terraform plan + Trivy + Rego under the hood).")
+    summary("- Verdict source: Aiden `mcp-tf-governance.validate_tf_governance`.")
 
     t0 = time.time()
     try:
