@@ -58,7 +58,8 @@ WEBHOOK_URL = env("AIDEN_DEPLOY_GATE_WEBHOOK_URL")
 
 PROJECT = env("GATE_PROJECT")            # e.g. sg-tf-demo-org/field-engineering
 REF = env("GATE_REF", default="main")
-TF_DIR = env("GATE_TF_DIR")              # e.g. environments/dev
+BASE_REF = env("GATE_BASE_REF", default="main")
+TF_DIR = env("GATE_TF_DIR")              # e.g. environments/dev (empty = pre-PR delta mode)
 ENVIRONMENT = env("GATE_ENVIRONMENT", default="dev")
 RUN_URL = env("GATE_RUN_URL")
 
@@ -239,8 +240,23 @@ def _parse_sse(raw: str) -> dict:
     return last
 
 
-def call_validate() -> dict:
-    """Full streamable-HTTP handshake + tools/call. Returns the verdict dict."""
+def call_validate(
+    *,
+    project: str | None = None,
+    ref: str | None = None,
+    base_ref: str | None = None,
+    tf_dir: str | None = None,
+) -> dict:
+    """Full streamable-HTTP handshake + tools/call. Returns the verdict dict.
+
+    Deploy-gate: pass tf_dir (scan that env only).
+    Pre-PR / PR backstop: omit tf_dir (scan changed dirs vs base_ref).
+    """
+    project = project if project is not None else PROJECT
+    ref = ref if ref is not None else REF
+    base_ref = base_ref if base_ref is not None else BASE_REF
+    tf_dir = TF_DIR if tf_dir is None else tf_dir
+
     init = {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
@@ -259,11 +275,15 @@ def call_validate() -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    args: dict = {"project": project, "ref": ref, "base_ref": base_ref or "main"}
+    if tf_dir:
+        args["tf_dir"] = tf_dir
+
     call = {
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {
             "name": "validate_tf_governance",
-            "arguments": {"project": PROJECT, "ref": REF, "tf_dir": TF_DIR},
+            "arguments": args,
         },
     }
     _code, resp, _sid = _mcp_post(call, sid)

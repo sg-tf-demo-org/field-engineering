@@ -1,12 +1,15 @@
 name: pr-governance-scan
 
 # ============================================================================
-# Notify Aiden of a PR, resolve the real Aiden watch URL (Guild session_id),
-# then attach that URL to the PR head COMMIT as a GitHub commit status so
-# reviewers can open the scan from the commit itself (Details link).
+# Human-first PR loop: every PR head SHA is scanned.
 #
-# The webhook `run_id` is NOT the UI watch id — we correlate via run_url and
-# link session:{session_id} (bare trace_id often 404s on /executions/.../subscribe).
+#   1. pending commit status aiden/governance
+#   2. webhook → Aiden watch session (reporter)
+#   3. mcp-tf-governance.validate_tf_governance directly (brain / plan+policies)
+#   4. commit status success|failure|error + Details → session:{id} watch URL
+#
+# Job fails on non-PASS so this can be a required check. CI never runs
+# terraform/Trivy itself — plan happens inside the governance MCP.
 # ============================================================================
 on:
   pull_request:
@@ -15,6 +18,10 @@ on:
       - "scenarios/**"
       - "environments/**"
       - "modules/**"
+      - "scripts/pr_aiden_gate.py"
+      - "scripts/aiden_gate.py"
+      - "scripts/resolve_aiden_watch.py"
+      - ".github/workflows/pr-governance.yml"
   workflow_dispatch:
 
 permissions:
@@ -22,7 +29,7 @@ permissions:
   statuses: write
 
 jobs:
-  notify-aiden:
+  aiden-governance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,95 +52,29 @@ jobs:
             echo '[]' > changed-files.json
           fi
 
-      - name: Notify Aiden and attach scan link to commit
+      - name: Aiden PR governance (MCP verdict + watch link)
         env:
+          GATE_PROJECT: ${{ github.repository }}
+          GATE_REPO: ${{ github.repository }}
+          GATE_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          GATE_BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
+          GATE_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GATE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GATE_PR_URL: ${{ github.event.pull_request.html_url }}
+          GATE_SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          GATE_TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+          GATE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_CHANGED_FILES: ${{ '' }}
           AIDEN_PR_GOVERNANCE_WEBHOOK_URL: ${{ secrets.AIDEN_PR_GOVERNANCE_WEBHOOK_URL }}
+          AIDEN_TF_GOV_MCP_URL: ${{ secrets.AIDEN_TF_GOV_MCP_URL }}
+          AIDEN_TF_GOV_MCP_TOKEN: ${{ secrets.AIDEN_TF_GOV_MCP_TOKEN }}
           AIDEN_GUILD_TOKEN: ${{ secrets.AIDEN_GUILD_TOKEN }}
           AIDEN_ORG_ID: ${{ secrets.AIDEN_ORG_ID }}
           AIDEN_GUILD_BASE: https://stage.dev.stackgen.com
           AIDEN_WATCH_RESOLVE_TIMEOUT: "90"
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REPO: ${{ github.repository }}
+          GATE_MCP_TIMEOUT: "600"
         run: |
           set -euo pipefail
-          if [ -z "${AIDEN_PR_GOVERNANCE_WEBHOOK_URL:-}" ]; then
-            echo "WARN: AIDEN_PR_GOVERNANCE_WEBHOOK_URL unset — skipping"
-            exit 0
-          fi
-
-          CHANGED=$(cat changed-files.json 2>/dev/null || echo '[]')
-          echo "$CHANGED" | jq -e . >/dev/null 2>&1 || CHANGED='[]'
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          COMMIT_SHA="${HEAD_SHA:-${{ github.sha }}}"
-
-          PAYLOAD=$(jq -n \
-            --arg project        "$REPO" \
-            --arg pr_number      "${{ github.event.pull_request.number }}" \
-            --arg pr_url         "${{ github.event.pull_request.html_url }}" \
-            --arg source_branch  "${{ github.event.pull_request.head.ref }}" \
-            --arg target_branch  "${{ github.event.pull_request.base.ref }}" \
-            --arg commit_sha     "$COMMIT_SHA" \
-            --arg run_url        "$RUN_URL" \
-            --argjson changed    "$CHANGED" \
-            '{
-              source: "github-actions",
-              event: "pr_governance_scan",
-              kind: "terraform",
-              project: $project,
-              pr_number: $pr_number,
-              pr_url: $pr_url,
-              source_branch: $source_branch,
-              target_branch: $target_branch,
-              commit_sha: $commit_sha,
-              run_url: $run_url,
-              changed_files: $changed,
-              instruction: "Terraform PR — run mcp-tf-governance.validate_tf_governance on this commit/branch, report PASS/FAIL or plan-failure, never apply."
-            }')
-
-          echo "Notifying Aiden..."
-          HTTP=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST "$AIDEN_PR_GOVERNANCE_WEBHOOK_URL" \
-            -H "Content-Type: application/json" -d "$PAYLOAD")
-          echo "webhook HTTP $HTTP"
-
-          # Resolve real watch URL (session:{session_id}), not webhook run_id / bare trace_id.
-          WATCH_URL=""
-          if [ -n "${AIDEN_GUILD_TOKEN:-}" ]; then
-            WATCH_URL=$(python3 scripts/resolve_aiden_watch.py "$RUN_URL" 2>/tmp/resolve.err || true)
-            cat /tmp/resolve.err 2>/dev/null || true
-          fi
-
-          if [ -z "$WATCH_URL" ]; then
-            echo "ERROR: could not resolve Aiden watch URL for commit $COMMIT_SHA"
-            # Still mark the commit so reviewers know a scan was attempted.
-            curl -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/statuses/${COMMIT_SHA}" \
-              -d "$(jq -n \
-                --arg desc "Aiden governance scan — watch URL not resolved" \
-                '{state:"error", context:"aiden/governance", description:$desc}')" \
-              >/dev/null || true
-            exit 0
-          fi
-
-          echo "Watch: $WATCH_URL"
-
-          # Attach the Aiden scan link to THIS commit (Details → opens Aiden).
-          curl -sS -o /tmp/status.json -w "status HTTP %{http_code}\n" -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/${REPO}/statuses/${COMMIT_SHA}" \
-            -d "$(jq -n \
-              --arg url "$WATCH_URL" \
-              --arg desc "Aiden governance scan — open to review" \
-              '{state:"success", target_url:$url, context:"aiden/governance", description:$desc}')"
-          cat /tmp/status.json | head -c 300; echo
-
-          {
-            echo "### Aiden governance"
-            echo ""
-            echo "Scan linked on commit \`${COMMIT_SHA:0:7}\`:"
-            echo "**[Open Aiden governance execution](${WATCH_URL})**"
-          } >> "$GITHUB_STEP_SUMMARY"
+          export GATE_CHANGED_FILES="$(cat changed-files.json 2>/dev/null || echo '[]')"
+          python3 scripts/pr_aiden_gate.py
