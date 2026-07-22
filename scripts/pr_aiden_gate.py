@@ -123,6 +123,31 @@ def post_commit_status(
         summary(f"- commit status error: `{e}`")
 
 
+def post_pr_comment(body_md: str) -> None:
+    """Post (or skip) a PR comment with the Aiden watch link."""
+    if not GH_TOKEN or not REPO or not PR_NUMBER:
+        return
+    url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"body": body_md}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            summary(f"- PR comment with Aiden watch link (HTTP {resp.status})")
+    except urllib.error.HTTPError as e:
+        summary(f"- PR comment HTTP {e.code}: {e.read().decode()[:200]}")
+    except Exception as e:  # noqa: BLE001
+        summary(f"- PR comment error: `{e}`")
+
+
 def fire_pr_webhook() -> tuple[str, str]:
     """Fire PR governance webhook; return (trace_id, session_id)."""
     if not WEBHOOK_URL:
@@ -163,10 +188,9 @@ def fire_pr_webhook() -> tuple[str, str]:
         return "", ""
 
     summary(f"- Aiden reporter: webhook HTTP `{code}`")
-    try:
-        json.loads(body or "{}")
-    except Exception:  # noqa: BLE001
-        pass
+    if code >= 400:
+        summary(f"- Aiden reporter: webhook body `{body[:400]}` — skipping watch resolve")
+        return "", ""
 
     if not RUN_URL or not GUILD_TOKEN:
         if not GUILD_TOKEN:
@@ -219,9 +243,14 @@ def main() -> int:
             "Aiden governance scan running — open to watch",
             target_url=link,
         )
+        post_pr_comment(
+            "### Aiden PR governance (terraform)\n\n"
+            f"[Open latest Aiden execution (watch)]({link})\n\n"
+            f"_Commit `{COMMIT_SHA[:7]}` · ref `{REF}` · check context `{STATUS_CONTEXT}` "
+            f"(Details on the status also links here)._"
+        )
     else:
         summary("- Aiden watch: not resolved yet (verdict still authoritative from MCP)")
-
     summary("- Verdict source: Aiden `mcp-tf-governance.validate_tf_governance` (plan-based).")
     t0 = time.time()
     try:

@@ -27,6 +27,8 @@ on:
 permissions:
   contents: read
   statuses: write
+  pull-requests: write
+  issues: write
 
 jobs:
   aiden-governance:
