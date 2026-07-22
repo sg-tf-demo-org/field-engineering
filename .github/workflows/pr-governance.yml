@@ -12,6 +12,9 @@ name: pr-governance-scan
 # plan-failure. The job summary links the Aiden execution watch URL so a human
 # can review (and approve) from what they see in Aiden.
 #
+# NOTE: the webhook's `run_id` is NOT the UI watch id. We resolve the real
+# `trace_id` from GET /guild/api/v1/executions by correlating on `run_url`.
+#
 # Nothing here ever runs `terraform apply`.
 # ============================================================================
 on:
@@ -23,8 +26,6 @@ on:
       - "modules/**"
   workflow_dispatch:
 
-# Only need to read the repo to compute the changed-file list. No id-token:
-# there is no OIDC / assume-role on this path.
 permissions:
   contents: read
 
@@ -35,6 +36,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Compute changed files
         id: diff
@@ -53,7 +58,10 @@ jobs:
       - name: Notify Aiden PR governance webhook
         env:
           AIDEN_PR_GOVERNANCE_WEBHOOK_URL: ${{ secrets.AIDEN_PR_GOVERNANCE_WEBHOOK_URL }}
-          AIDEN_WATCH_BASE: https://stage.dev.stackgen.com/app/settings/workspace/devops-copilot/executions
+          AIDEN_GUILD_TOKEN: ${{ secrets.AIDEN_GUILD_TOKEN }}
+          AIDEN_ORG_ID: ${{ secrets.AIDEN_ORG_ID }}
+          AIDEN_GUILD_BASE: https://stage.dev.stackgen.com
+          AIDEN_WATCH_RESOLVE_TIMEOUT: "90"
         run: |
           set +e
           if [ -z "${AIDEN_PR_GOVERNANCE_WEBHOOK_URL:-}" ]; then
@@ -63,6 +71,7 @@ jobs:
 
           CHANGED=$(cat changed-files.json 2>/dev/null || echo '[]')
           echo "$CHANGED" | jq -e . >/dev/null 2>&1 || CHANGED='[]'
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Report-only payload. CI does NOT compute a verdict — Aiden does via
           # mcp-tf-governance.validate_tf_governance.
@@ -72,7 +81,7 @@ jobs:
             --arg pr_url         "${{ github.event.pull_request.html_url }}" \
             --arg source_branch  "${{ github.event.pull_request.head.ref }}" \
             --arg target_branch  "${{ github.event.pull_request.base.ref }}" \
-            --arg run_url        "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg run_url        "$RUN_URL" \
             --argjson changed    "$CHANGED" \
             '{
               source: "github-actions",
@@ -92,12 +101,17 @@ jobs:
           HTTP=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST "$AIDEN_PR_GOVERNANCE_WEBHOOK_URL" \
             -H "Content-Type: application/json" -d "$PAYLOAD")
           echo "HTTP $HTTP"
-          cat /tmp/resp.json 2>/dev/null | head -c 800; echo
-          RUN_ID=$(jq -r '.run_id // empty' /tmp/resp.json 2>/dev/null)
+          cat /tmp/resp.json 2>/dev/null | head -c 400; echo
+
+          # Webhook run_id is NOT the UI watch id. Resolve the real trace_id by
+          # correlating on run_url embedded in the agent prompt.
           WATCH_URL=""
-          if [ -n "${RUN_ID:-}" ]; then
-            RID_NODASH=$(echo "$RUN_ID" | tr -d '-')
-            WATCH_URL="${AIDEN_WATCH_BASE}/${RID_NODASH}/watch"
+          if [ -n "${AIDEN_GUILD_TOKEN:-}" ]; then
+            echo "Resolving Aiden watch URL (correlate on run_url)..."
+            WATCH_URL=$(python3 scripts/resolve_aiden_watch.py "$RUN_URL" 2>/tmp/resolve.err || true)
+            cat /tmp/resolve.err 2>/dev/null || true
+          else
+            echo "WARN: AIDEN_GUILD_TOKEN unset — cannot resolve watchable execution id"
           fi
 
           {
@@ -109,11 +123,11 @@ jobs:
               echo "**[Open Aiden governance execution](${WATCH_URL})**"
               echo ""
               echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
-              echo "- Watch URL: ${WATCH_URL}"
+              echo "- Watch: ${WATCH_URL}"
             else
               echo ""
               echo "- Branch: \`${{ github.event.pull_request.head.ref }}\`"
-              echo "- Aiden execution: not returned (webhook HTTP \`${HTTP}\`)"
+              echo "- Watch URL: not resolved yet (open Aiden → Executions and filter for this PR)"
             fi
             echo "- Webhook HTTP: \`${HTTP}\`"
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
@@ -122,6 +136,6 @@ jobs:
             echo "OK: notified Aiden (HTTP $HTTP)"
             echo "Watch: $WATCH_URL"
           else
-            echo "WARN: Aiden webhook HTTP $HTTP (no run_id / watch URL)"
+            echo "WARN: Aiden webhook HTTP $HTTP (watch URL not resolved)"
           fi
           exit 0

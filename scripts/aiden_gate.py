@@ -33,6 +33,13 @@ import time
 import urllib.error
 import urllib.request
 
+# Local helper: webhook run_id ≠ UI watch id. Resolve real trace_id via Guild list.
+try:
+    from resolve_aiden_watch import resolve_trace_id, watch_url as _trace_watch_url
+except ImportError:  # when run as scripts/aiden_gate.py from repo root
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from resolve_aiden_watch import resolve_trace_id, watch_url as _trace_watch_url
+
 
 def env(*names: str, default: str = "") -> str:
     for n in names:
@@ -44,7 +51,7 @@ def env(*names: str, default: str = "") -> str:
 
 GUILD_BASE = env("AIDEN_GUILD_BASE", default="https://stage.dev.stackgen.com").rstrip("/")
 ORG_ID = env("AIDEN_ORG_ID", default="aee77bee-6885-4b4b-b9c0-e0c7ae81be96")
-GUILD_TOKEN = env("AIDEN_GUILD_TOKEN")  # optional; used to fetch execution status
+GUILD_TOKEN = env("AIDEN_GUILD_TOKEN")  # required to resolve watchable trace_id
 MCP_URL = env("AIDEN_TF_GOV_MCP_URL", default="https://mcp-tf-governance.stackgen.run/mcp")
 MCP_TOKEN = env("AIDEN_TF_GOV_MCP_TOKEN")
 WEBHOOK_URL = env("AIDEN_DEPLOY_GATE_WEBHOOK_URL")
@@ -58,6 +65,7 @@ RUN_URL = env("GATE_RUN_URL")
 MCP_TIMEOUT = int(env("GATE_MCP_TIMEOUT", default="600"))  # tool call read timeout
 EXEC_POLL_INTERVAL = int(env("GATE_EXEC_POLL_INTERVAL", default="10"))
 EXEC_POLL_TIMEOUT = int(env("GATE_EXEC_POLL_TIMEOUT", default="120"))
+WATCH_RESOLVE_TIMEOUT = int(env("AIDEN_WATCH_RESOLVE_TIMEOUT", default="90"))
 
 
 def summary(md: str) -> None:
@@ -71,18 +79,23 @@ def summary(md: str) -> None:
             pass
 
 
-def watch_url(run_id: str) -> str:
-    rid = (run_id or "").replace("-", "")
-    return f"{GUILD_BASE}/app/settings/workspace/devops-copilot/executions/{rid}/watch"
+def watch_url(trace_id: str) -> str:
+    """UI watch URL from Guild list `trace_id` — never from webhook `run_id`."""
+    return _trace_watch_url(trace_id)
 
 
 # --------------------------------------------------------------------------- #
 # 1) Reporter: fire the Aiden webhook (best-effort) to create a watchable run.
 # --------------------------------------------------------------------------- #
-def fire_webhook() -> str:
+def fire_webhook() -> tuple[str, str]:
+    """POST webhook; return (webhook_run_id, watchable_trace_id).
+
+    The webhook `run_id` is NOT the UI watch id. After firing we resolve the
+    real `trace_id` by correlating on RUN_URL (embedded in the agent prompt).
+    """
     if not WEBHOOK_URL:
         summary("- Aiden reporter: `AIDEN_DEPLOY_GATE_WEBHOOK_URL` unset — skipping watch run.")
-        return ""
+        return "", ""
     payload = {
         "source": "github-actions",
         "event": "deploy_governance_gate",
@@ -112,35 +125,52 @@ def fire_webhook() -> str:
         code, body = e.code, e.read().decode()
     except Exception as e:  # noqa: BLE001
         summary(f"- Aiden reporter: webhook error (non-fatal): `{e}`")
-        return ""
+        return "", ""
     run_id = ""
     try:
         run_id = (json.loads(body) or {}).get("run_id", "") or ""
     except Exception:  # noqa: BLE001
         pass
-    if run_id:
-        summary(f"- Aiden reporter run: [`{run_id}`]({watch_url(run_id)}) "
-                f"(watch Aiden govern `{ENVIRONMENT}` live) · webhook HTTP `{code}`")
+
+    # Correlate on run_url (preferred) — never use webhook run_id as the watch URL.
+    marker = RUN_URL or ""
+    trace_id = ""
+    if marker and GUILD_TOKEN:
+        summary("- Resolving Aiden watch URL (correlate on run_url)...")
+        trace_id = resolve_trace_id(marker, timeout_s=WATCH_RESOLVE_TIMEOUT)
+    elif not GUILD_TOKEN:
+        summary("- Aiden reporter: `AIDEN_GUILD_TOKEN` unset — cannot resolve watchable execution id")
+
+    if trace_id:
+        summary(
+            f"- Aiden reporter: [watch Aiden govern `{ENVIRONMENT}` live]({watch_url(trace_id)}) "
+            f"· webhook HTTP `{code}`"
+        )
+    elif run_id:
+        summary(
+            f"- Aiden reporter: webhook HTTP `{code}` (run created; watch URL not resolved yet — "
+            "open Aiden → Executions)"
+        )
     else:
         summary(f"- Aiden reporter: webhook HTTP `{code}` (no run_id returned)")
-    return run_id
+    return run_id, trace_id
 
 
-def fetch_execution_status(run_id: str) -> str:
-    """GET /guild/api/v1/executions/{run_id} and return status (best-effort).
+def fetch_execution_status(trace_id: str) -> str:
+    """GET /guild/api/v1/executions/{trace_id} and return status (best-effort).
 
-    The Guild API exposes status (completed/failed/...) but NOT findings/verdict
-    (structured_output is empty). We still fetch + print status so the job shows
-    the execution was retrieved; the authoritative PASS/FAIL comes from the MCP.
+    Prefer the resolved Guild list `trace_id` (watchable). The webhook `run_id`
+    is a different id and often 404s here. Status is informational only —
+    authoritative PASS/FAIL comes from the MCP.
     """
-    if not run_id:
+    if not trace_id:
         return ""
-    # Prefer a Guild token when present; fall back to unauthenticated GET (may 401).
     headers = {"Accept": "application/json"}
     if GUILD_TOKEN:
         headers["Authorization"] = f"Bearer {GUILD_TOKEN}"
         headers["x-org-id"] = ORG_ID
-    url = f"{GUILD_BASE}/guild/api/v1/executions/{run_id}?orgId={ORG_ID}"
+    rid = (trace_id or "").replace("-", "")
+    url = f"{GUILD_BASE}/guild/api/v1/executions/{rid}?orgId={ORG_ID}"
     deadline = time.time() + EXEC_POLL_TIMEOUT
     last_status = ""
     while time.time() < deadline:
@@ -158,9 +188,9 @@ def fetch_execution_status(run_id: str) -> str:
         time.sleep(EXEC_POLL_INTERVAL)
     if last_status:
         summary(f"- Aiden execution status (fetched): `{last_status}` · "
-                f"[watch]({watch_url(run_id)})")
+                f"[watch]({watch_url(trace_id)})")
     else:
-        summary(f"- Aiden execution status: not available · [watch]({watch_url(run_id)})")
+        summary(f"- Aiden execution status: not available · [watch]({watch_url(trace_id)})")
     return last_status
 
 
@@ -261,9 +291,9 @@ def main() -> int:
     summary(f"## Governance - {ENVIRONMENT} (Aiden)")
     summary(f"- Project: `{PROJECT}` · ref: `{REF}` · dir: `{TF_DIR}`")
 
-    run_id = fire_webhook()
-    if run_id:
-        fetch_execution_status(run_id)
+    _webhook_run_id, trace_id = fire_webhook()
+    if trace_id:
+        fetch_execution_status(trace_id)
 
     summary("- Verdict source: Aiden `mcp-tf-governance.validate_tf_governance`.")
 
@@ -272,8 +302,8 @@ def main() -> int:
         verdict = call_validate()
     except Exception as e:  # noqa: BLE001
         summary(f"\n**Result: ERROR (fail-closed)** — could not obtain a verdict from Aiden: `{e}`")
-        if run_id:
-            summary(f"See the Aiden run: {watch_url(run_id)}")
+        if trace_id:
+            summary(f"See the Aiden run: {watch_url(trace_id)}")
         return 1
     dt = int(time.time() - t0)
 
@@ -285,8 +315,8 @@ def main() -> int:
     plan_error = (verdict.get("plan_error") or "").strip()
 
     summary(f"- Gates: `{gate_line}` · scanned: `{scanned}` · {dt}s")
-    if run_id:
-        summary(f"- Aiden watch: {watch_url(run_id)}")
+    if trace_id:
+        summary(f"- Aiden watch: {watch_url(trace_id)}")
     if v == "PASS":
         summary(f"\n**Result: PASS ✅** — `{ENVIRONMENT}` governance passed. "
                 "Deploy (plan-only) may proceed after approval.")
