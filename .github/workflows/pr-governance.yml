@@ -1,11 +1,12 @@
 name: pr-governance-scan
 
 # ============================================================================
-# Notify Aiden of a PR, resolve the real Aiden watch URL (Guild trace_id), then
-# attach that URL to the PR head COMMIT as a GitHub commit status so reviewers
-# can open the scan from the commit itself (Details link).
+# Notify Aiden of a PR, resolve the real Aiden watch URL (Guild session_id),
+# then attach that URL to the PR head COMMIT as a GitHub commit status so
+# reviewers can open the scan from the commit itself (Details link).
 #
-# The webhook `run_id` is NOT the UI watch id — we correlate via run_url.
+# The webhook `run_id` is NOT the UI watch id — we correlate via run_url and
+# link session:{session_id} (bare trace_id often 404s on /executions/.../subscribe).
 # ============================================================================
 on:
   pull_request:
@@ -95,7 +96,7 @@ jobs:
             -H "Content-Type: application/json" -d "$PAYLOAD")
           echo "webhook HTTP $HTTP"
 
-          # Resolve real watch URL (trace_id), not webhook run_id.
+          # Resolve real watch URL (session:{session_id}), not webhook run_id / bare trace_id.
           WATCH_URL=""
           if [ -n "${AIDEN_GUILD_TOKEN:-}" ]; then
             WATCH_URL=$(python3 scripts/resolve_aiden_watch.py "$RUN_URL" 2>/tmp/resolve.err || true)
