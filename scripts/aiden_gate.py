@@ -252,10 +252,30 @@ def call_validate(
     Deploy-gate: pass tf_dir (scan that env only).
     Pre-PR / PR backstop: omit tf_dir (scan changed dirs vs base_ref).
     """
+    import socket
+    from urllib.parse import urlparse
+
     project = project if project is not None else PROJECT
     ref = ref if ref is not None else REF
     base_ref = base_ref if base_ref is not None else BASE_REF
     tf_dir = TF_DIR if tf_dir is None else tf_dir
+
+    if not MCP_URL:
+        raise RuntimeError("AIDEN_TF_GOV_MCP_URL is empty")
+    host = urlparse(MCP_URL).hostname or ""
+    if host.endswith(".cluster.local") or host.endswith(".svc"):
+        raise RuntimeError(
+            f"AIDEN_TF_GOV_MCP_URL is cluster-local ({host}) — use "
+            "https://mcp-tf-governance.stackgen.run/mcp "
+            "(scripts/demo-governance/sync_github_gate_secrets.py)."
+        )
+    try:
+        socket.getaddrinfo(host, 443)
+    except socket.gaierror as e:
+        raise RuntimeError(
+            f"DNS failed for MCP host {host!r} ({e}). "
+            "Re-sync with scripts/demo-governance/sync_github_gate_secrets.py"
+        ) from e
 
     init = {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -265,44 +285,53 @@ def call_validate(
             "clientInfo": {"name": "aiden-gate", "version": "1.0"},
         },
     }
-    _code, _resp, sid = _mcp_post(init)
-    if not sid:
-        raise RuntimeError("MCP initialize returned no mcp-session-id")
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            _code, _resp, sid = _mcp_post(init)
+            if not sid:
+                raise RuntimeError("MCP initialize returned no mcp-session-id")
 
-    # notifications/initialized (no response body expected)
-    try:
-        _mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
-    except Exception:  # noqa: BLE001
-        pass
+            # notifications/initialized (no response body expected)
+            try:
+                _mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+            except Exception:  # noqa: BLE001
+                pass
 
-    args: dict = {"project": project, "ref": ref, "base_ref": base_ref or "main"}
-    if tf_dir:
-        args["tf_dir"] = tf_dir
+            args: dict = {"project": project, "ref": ref, "base_ref": base_ref or "main"}
+            if tf_dir:
+                args["tf_dir"] = tf_dir
 
-    call = {
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {
-            "name": "validate_tf_governance",
-            "arguments": args,
-        },
-    }
-    _code, resp, _sid = _mcp_post(call, sid)
-    if "error" in resp:
-        raise RuntimeError(f"MCP tool error: {resp['error']}")
-    result = resp.get("result", {})
-    content = result.get("content", [])
-    text = ""
-    for c in content:
-        if c.get("type") == "text":
-            text = c.get("text", "")
-            break
-    if not text:
-        # Some servers return structuredContent directly.
-        sc = result.get("structuredContent")
-        if isinstance(sc, dict):
-            return sc
-        raise RuntimeError(f"MCP tool returned no text content: {json.dumps(result)[:500]}")
-    return json.loads(text)
+            call = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "validate_tf_governance", "arguments": args},
+            }
+            _code, resp, _sid = _mcp_post(call, sid)
+            if "error" in resp:
+                raise RuntimeError(f"MCP tool error: {resp['error']}")
+            result = resp.get("result", {})
+            content = result.get("content", [])
+            text = ""
+            for c in content:
+                if c.get("type") == "text":
+                    text = c.get("text", "")
+                    break
+            if not text:
+                sc = result.get("structuredContent")
+                if isinstance(sc, dict):
+                    return sc
+                raise RuntimeError(
+                    f"MCP tool returned no text content: {json.dumps(result)[:500]}"
+                )
+            return json.loads(text)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    assert last_err is not None
+    raise last_err
 
 
 def main() -> int:
