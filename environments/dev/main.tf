@@ -61,3 +61,15 @@ module "github_oidc" {
   create_oidc_provider = var.create_oidc_provider
   tags                 = local.tags
 }
+
+module "s3_cmk" {
+  source = "../../modules/s3-cmk"
+
+  bucket_name = "${local.name_prefix}-demo-data"
+
+  tags = merge(local.tags, {
+    Owner       = "platform"
+    CostCenter  = "FE-DEMO"
+    Environment = "dev"
+  })
+}
