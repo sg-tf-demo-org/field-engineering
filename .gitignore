@@ -18,3 +18,11 @@ gate-result.json
 *.auto.tfvars
 .env
 *.pem
+
+# cloud2code live import local artifacts
+cloud2code/**/.terraform/
+cloud2code/**/*.tfstate
+cloud2code/**/*.tfstate.*
+cloud2code/**/.local/
+cloud2code/**/tfplan*
+cloud2code/**/*.log
