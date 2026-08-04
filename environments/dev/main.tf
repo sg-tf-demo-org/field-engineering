@@ -61,3 +61,8 @@ module "github_oidc" {
   create_oidc_provider = var.create_oidc_provider
   tags                 = local.tags
 }
+
+module "s3_assets" {
+  source      = "../../modules/s3-assets"
+  bucket_name = "fe-demo-assets-dev"
+}
