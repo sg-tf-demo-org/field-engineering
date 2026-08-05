@@ -1,2 +1,2 @@
-# Baseline (connection exhaustion demo). IE PR raises to 200.
-max_connections = 50
+# Remediated capacity after SRE O4 handoff.
+max_connections = 200
